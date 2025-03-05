@@ -12,9 +12,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from prophet import Prophet
 
 # Set page configuration
@@ -150,39 +149,55 @@ def prepare_data_for_prediction(df, parameter_name, model_type="rf"):
     param_df = df[df['parameter'] == parameter_name].copy()
     
     if param_df.empty:
-        return None, None, None, None
+        return None, None, None, None, None
     
     # Sort by datetime
     param_df = param_df.sort_values('dateTime')
     
+    # Remove outliers (optional) - using IQR method
+    Q1 = param_df['value'].quantile(0.25)
+    Q3 = param_df['value'].quantile(0.75)
+    IQR = Q3 - Q1
+    
+    # Define bounds for outliers (less strict for water data which can have natural spikes)
+    lower_bound = Q1 - 3 * IQR
+    upper_bound = Q3 + 3 * IQR
+    
+    # Filter out extreme outliers
+    param_df_filtered = param_df[(param_df['value'] >= lower_bound) & (param_df['value'] <= upper_bound)]
+    
+    # If we removed too many points, revert to original data
+    if len(param_df_filtered) < 0.8 * len(param_df):
+        param_df_filtered = param_df
+    
     # For time series models, we need a clean datetime index and value series
-    ts_df = param_df.copy()
+    ts_df = param_df_filtered.copy()
     ts_df = ts_df[['dateTime', 'value']].set_index('dateTime')
     ts_df = ts_df.resample('H').mean().fillna(method='ffill')  # Hourly resampling for uniform time series
     
     # For ML models, create features
     if model_type == "rf":
         # Create features for Random Forest
-        param_df['hour'] = param_df['dateTime'].dt.hour
-        param_df['day'] = param_df['dateTime'].dt.day
-        param_df['month'] = param_df['dateTime'].dt.month
-        param_df['dayofweek'] = param_df['dateTime'].dt.dayofweek
-        param_df['year'] = param_df['dateTime'].dt.year
-        param_df['quarter'] = param_df['dateTime'].dt.quarter
+        param_df_filtered['hour'] = param_df_filtered['dateTime'].dt.hour
+        param_df_filtered['day'] = param_df_filtered['dateTime'].dt.day
+        param_df_filtered['month'] = param_df_filtered['dateTime'].dt.month
+        param_df_filtered['dayofweek'] = param_df_filtered['dateTime'].dt.dayofweek
+        param_df_filtered['year'] = param_df_filtered['dateTime'].dt.year
+        param_df_filtered['quarter'] = param_df_filtered['dateTime'].dt.quarter
         
         # Create lag features (previous values)
         for i in range(1, 25):  # 24 hour lags
-            param_df[f'lag_{i}h'] = param_df['value'].shift(i)
+            param_df_filtered[f'lag_{i}h'] = param_df_filtered['value'].shift(i)
         
         # Create rolling mean features
         for window in [6, 12, 24, 48]:
-            param_df[f'rolling_mean_{window}h'] = param_df['value'].rolling(window=window).mean()
+            param_df_filtered[f'rolling_mean_{window}h'] = param_df_filtered['value'].rolling(window=window).mean()
         
         # Drop NaN values after creating lag features
-        param_df = param_df.dropna()
+        param_df_filtered = param_df_filtered.dropna()
         
         # Target variable
-        y = param_df['value'].values
+        y = param_df_filtered['value'].values
         
         # Basic time features
         time_features = ['hour', 'day', 'month', 'dayofweek', 'year', 'quarter']
@@ -197,13 +212,13 @@ def prepare_data_for_prediction(df, parameter_name, model_type="rf"):
         all_features = time_features + lag_features + rolling_features
         
         # Features
-        X = param_df[all_features].values
+        X = param_df_filtered[all_features].values
         
         # Feature names for importance analysis
         feature_names = all_features
         
         # Original datetimes for plotting
-        dates = param_df['dateTime'].values
+        dates = param_df_filtered['dateTime'].values
         
         return X, y, dates, feature_names, ts_df
     
@@ -230,37 +245,93 @@ def train_prediction_model(X, y, feature_names, ts_df, parameter_name, model_typ
         
         return {"type": "rf", "model": model, "mse": mse, "r2": r2, "feature_names": feature_names}
     
-    elif model_type == "arima" and ts_df is not None and len(ts_df) >= 24:
+    elif model_type == "sarimax" and ts_df is not None and len(ts_df) >= 48:
         try:
-            # Fit ARIMA model (p,d,q) parameters
-            # p: AR order, d: differencing, q: MA order
-            model = ARIMA(ts_df, order=(5,1,0))
-            model_fit = model.fit()
+            # Fit SARIMAX model (p,d,q)x(P,D,Q,s) parameters
+            # p,d,q: non-seasonal parameters
+            # P,D,Q: seasonal parameters
+            # s: seasonal period (24 for hourly data with daily seasonality)
+            
+            # Start with a simple model and increase complexity if needed
+            model = SARIMAX(
+                ts_df, 
+                order=(1, 1, 1),             # (p,d,q) non-seasonal part
+                seasonal_order=(1, 0, 1, 24),  # (P,D,Q,s) seasonal part (24-hour seasonality)
+                enforce_stationarity=False,
+                enforce_invertibility=False
+            )
+            
+            # Fit the model with appropriate options for convergence
+            model_fit = model.fit(disp=False, maxiter=200)
             
             # Get in-sample predictions and calculate metrics
             in_sample_pred = model_fit.fittedvalues
-            mse = mean_squared_error(ts_df['value'][5:], in_sample_pred)
-            r2 = r2_score(ts_df['value'][5:], in_sample_pred)
             
-            return {"type": "arima", "model": model_fit, "mse": mse, "r2": r2}
+            # Make sure both arrays have the same length for metric calculation
+            actual_values = ts_df['value'].iloc[len(ts_df) - len(in_sample_pred):]
+            
+            mse = mean_squared_error(actual_values, in_sample_pred)
+            r2 = r2_score(actual_values, in_sample_pred)
+            
+            return {"type": "sarimax", "model": model_fit, "mse": mse, "r2": r2}
         except Exception as e:
-            st.warning(f"Error fitting ARIMA model: {str(e)}")
-            return None
+            st.warning(f"Error fitting SARIMAX model: {str(e)}")
+            st.warning("Trying simpler SARIMAX model...")
+            
+            try:
+                # Try an even simpler model if the first one fails
+                model = SARIMAX(
+                    ts_df, 
+                    order=(1, 1, 0),        # AR(1) with differencing
+                    enforce_stationarity=False
+                )
+                model_fit = model.fit(disp=False, maxiter=100)
+                
+                # Calculate metrics with properly aligned data
+                in_sample_pred = model_fit.fittedvalues
+                actual_values = ts_df['value'].iloc[len(ts_df) - len(in_sample_pred):]
+                
+                mse = mean_squared_error(actual_values, in_sample_pred)
+                r2 = r2_score(actual_values, in_sample_pred)
+                
+                return {"type": "sarimax", "model": model_fit, "mse": mse, "r2": r2}
+            except Exception as e:
+                st.warning(f"Error fitting simple SARIMAX model: {str(e)}")
+                return None
     
     elif model_type == "prophet" and ts_df is not None and len(ts_df) >= 24:
         try:
+            # Calculate reasonable cap and floor values
+            max_val = ts_df['value'].max()
+            min_val = max(0, ts_df['value'].min())  # Ensure minimum is not negative
+            
+            # Use 2x the max value as a generous but reasonable cap
+            cap_value = max(max_val * 2, max_val + 100)
+            
             # Prepare data for Prophet - ensure datetime has no timezone
             prophet_df = pd.DataFrame({
                 'ds': ts_df.index.tz_localize(None),
-                'y': ts_df['value'].values
+                'y': ts_df['value'].values,
+                'cap': cap_value,
+                'floor': min_val
             })
             
-            # Train Prophet model
-            model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
+            # Train Prophet model with logistic growth to bound predictions
+            model = Prophet(
+                growth='logistic',  # Use logistic growth to enforce cap/floor
+                daily_seasonality=True, 
+                weekly_seasonality=True, 
+                yearly_seasonality=True,
+                seasonality_mode='multiplicative'  # Better for data with increasing variance
+            )
+            
             model.fit(prophet_df)
             
             # Make in-sample predictions for metrics
             future = model.make_future_dataframe(periods=0, freq='H')
+            future['cap'] = cap_value
+            future['floor'] = min_val
+            
             forecast = model.predict(future)
             
             # Calculate metrics on the training data
@@ -270,26 +341,46 @@ def train_prediction_model(X, y, feature_names, ts_df, parameter_name, model_typ
             mse = mean_squared_error(prophet_actual, prophet_pred)
             r2 = r2_score(prophet_actual, prophet_pred)
             
-            return {"type": "prophet", "model": model, "mse": mse, "r2": r2}
+            # Return the cap and floor values along with the model
+            return {
+                "type": "prophet", 
+                "model": model, 
+                "mse": mse, 
+                "r2": r2, 
+                "cap": cap_value, 
+                "floor": min_val
+            }
         except Exception as e:
             st.warning(f"Error fitting Prophet model: {str(e)}")
             return None
     
     elif model_type == "holt_winters" and ts_df is not None and len(ts_df) >= 48:
         try:
-            # Fit Holt-Winters Exponential Smoothing
+            # Fit Holt-Winters Exponential Smoothing with damped trend
             model = ExponentialSmoothing(
                 ts_df['value'],
                 trend='add',
                 seasonal='add',
+                damped_trend=True,  # Add damping to prevent explosive forecasts
                 seasonal_periods=24  # Assuming daily seasonality with hourly data
             )
-            model_fit = model.fit()
+            model_fit = model.fit(optimized=True)
             
             # Get in-sample predictions and calculate metrics
             in_sample_pred = model_fit.fittedvalues
-            mse = mean_squared_error(ts_df['value'][24:], in_sample_pred[24:])
-            r2 = r2_score(ts_df['value'][24:], in_sample_pred[24:])
+            
+            # First few values may be NaN due to initialization
+            valid_indices = ~np.isnan(in_sample_pred)
+            
+            if sum(valid_indices) > 0:
+                in_sample_pred_valid = in_sample_pred[valid_indices]
+                actual_values_valid = ts_df['value'].iloc[valid_indices]
+                
+                mse = mean_squared_error(actual_values_valid, in_sample_pred_valid)
+                r2 = r2_score(actual_values_valid, in_sample_pred_valid)
+            else:
+                mse = np.nan
+                r2 = np.nan
             
             return {"type": "holt_winters", "model": model_fit, "mse": mse, "r2": r2}
         except Exception as e:
@@ -356,6 +447,10 @@ def predict_future(model_results, last_date, ts_df, days_ahead=7):
             
             # Make prediction for this hour
             pred = model.predict([all_feats])[0]
+            
+            # Ensure prediction is not negative (for physical quantities like flow)
+            pred = max(0, pred)
+            
             hourly_predictions.append(pred)
             
             # Update last_values with the new prediction for next iteration
@@ -364,25 +459,56 @@ def predict_future(model_results, last_date, ts_df, days_ahead=7):
         # Return future dates and predictions
         return future_dates, hourly_predictions
     
-    elif model_type == "arima":
-        # Use ARIMA's built-in forecast method
-        forecast_result = model.forecast(steps=len(future_dates))
-        return future_dates, forecast_result
+    elif model_type == "sarimax":
+        # Use SARIMAX's built-in forecast method
+        try:
+            forecast_result = model.forecast(steps=len(future_dates))
+            # Ensure non-negative values for physical quantities
+            forecast_result = np.maximum(forecast_result, 0)
+            return future_dates, forecast_result
+        except Exception as e:
+            st.warning(f"Error during SARIMAX forecasting: {str(e)}")
+            return future_dates, np.zeros(len(future_dates))
     
     elif model_type == "prophet":
-        # Create future dataframe for Prophet
+        # Create future dataframe for Prophet with cap and floor
         future = model.make_future_dataframe(periods=len(future_dates), freq='H')
+        
+        # Add cap and floor to future dataframe
+        cap_value = model_results.get("cap", ts_df['value'].max() * 2)
+        floor_value = model_results.get("floor", 0)
+        
+        future['cap'] = cap_value
+        future['floor'] = floor_value
+        
+        # Make the forecast
         forecast = model.predict(future)
         
         # Get the predictions for the future dates only
         future_predictions = forecast.tail(len(future_dates))['yhat'].values
         
+        # Ensure predictions stay within reasonable bounds
+        future_predictions = np.minimum(future_predictions, cap_value)
+        future_predictions = np.maximum(future_predictions, floor_value)
+        
         return future_dates, future_predictions
     
     elif model_type == "holt_winters":
-        # Use Holt-Winters forecast method
-        forecast_result = model.forecast(steps=len(future_dates))
-        return future_dates, forecast_result
+        try:
+            # Use Holt-Winters forecast method
+            forecast_result = model.forecast(steps=len(future_dates))
+            
+            # Ensure non-negative values for physical quantities
+            forecast_result = np.maximum(forecast_result, 0)
+            
+            # Detect and fix unreasonable forecasts (more than 3x the historical max)
+            max_historical = ts_df['value'].max()
+            forecast_result = np.minimum(forecast_result, max_historical * 3)
+            
+            return future_dates, forecast_result
+        except Exception as e:
+            st.warning(f"Error during Holt-Winters forecasting: {str(e)}")
+            return future_dates, np.zeros(len(future_dates))
     
     else:
         return None, None
@@ -673,14 +799,14 @@ if selected_site_id:
             # Model selection
             model_type = st.selectbox(
                 "Select Prediction Model",
-                ["Random Forest (ML)", "ARIMA (Time Series)", "Prophet (Time Series)", "Holt-Winters (Time Series)"],
+                ["Random Forest (ML)", "SARIMAX (Time Series)", "Prophet (Time Series)", "Holt-Winters (Time Series)"],
                 help="Choose the type of model for predictions"
             )
             
             # Map selected model to internal code
             model_map = {
                 "Random Forest (ML)": "rf",
-                "ARIMA (Time Series)": "arima",
+                "SARIMAX (Time Series)": "sarimax",
                 "Prophet (Time Series)": "prophet",
                 "Holt-Winters (Time Series)": "holt_winters"
             }
@@ -694,7 +820,7 @@ if selected_site_id:
                 X, y, dates, feature_names, ts_df = prepare_data_for_prediction(df, param, selected_model)
                 
                 # Determine if we have enough data
-                min_data_points = 48 if selected_model == "holt_winters" else 24
+                min_data_points = 48 if selected_model in ["holt_winters", "sarimax"] else 24
                 has_enough_data = (
                     (selected_model == "rf" and X is not None and len(X) >= min_data_points) or
                     (selected_model != "rf" and ts_df is not None and len(ts_df) >= min_data_points)
@@ -714,6 +840,85 @@ if selected_site_id:
                                 last_date = pd.to_datetime(dates[-1])
                             else:
                                 last_date = ts_df.index[-1]
+                            
+                            # Display in-sample fit evaluation
+                            if selected_model != "rf":
+                                st.subheader("Model Validation")
+                                
+                                if selected_model == "sarimax":
+                                    # Get in-sample predictions for SARIMAX
+                                    in_sample_pred = model_results["model"].fittedvalues
+                                    actual_values = ts_df['value'].iloc[len(ts_df) - len(in_sample_pred):]
+                                    
+                                    # Create dataframe for in-sample validation plot
+                                    validation_df = pd.DataFrame({
+                                        'Date': actual_values.index,
+                                        'Actual': actual_values.values,
+                                        'Fitted': in_sample_pred
+                                    })
+                                    
+                                    # Plot validation
+                                    fig_val = px.line(
+                                        validation_df,
+                                        x='Date',
+                                        y=['Actual', 'Fitted'],
+                                        title=f"In-sample fit for {param} using {model_type}"
+                                    )
+                                    st.plotly_chart(fig_val, use_container_width=True)
+                                
+                                elif selected_model == "prophet":
+                                    # Get prophet's in-sample predictions
+                                    model = model_results["model"]
+                                    
+                                    # Create future dataframe for the historical period
+                                    historical_future = model.make_future_dataframe(periods=0, freq='H')
+                                    historical_future['cap'] = model_results.get("cap", ts_df['value'].max() * 2)
+                                    historical_future['floor'] = model_results.get("floor", 0)
+                                    
+                                    # Get predictions
+                                    historical_forecast = model.predict(historical_future)
+                                    
+                                    # Create validation dataframe
+                                    validation_df = pd.DataFrame({
+                                        'Date': historical_forecast['ds'],
+                                        'Actual': ts_df['value'].reindex(historical_forecast['ds']).values,
+                                        'Fitted': historical_forecast['yhat'].values
+                                    })
+                                    
+                                    # Plot validation
+                                    fig_val = px.line(
+                                        validation_df,
+                                        x='Date',
+                                        y=['Actual', 'Fitted'],
+                                        title=f"In-sample fit for {param} using {model_type}"
+                                    )
+                                    st.plotly_chart(fig_val, use_container_width=True)
+                                
+                                elif selected_model == "holt_winters":
+                                    # Get in-sample predictions for Holt-Winters
+                                    in_sample_pred = model_results["model"].fittedvalues
+                                    
+                                    # Handle NaN values from initialization period
+                                    valid_indices = ~np.isnan(in_sample_pred)
+                                    dates_valid = ts_df.index[valid_indices]
+                                    actual_values_valid = ts_df['value'].iloc[valid_indices]
+                                    in_sample_pred_valid = in_sample_pred[valid_indices]
+                                    
+                                    # Create validation dataframe
+                                    validation_df = pd.DataFrame({
+                                        'Date': dates_valid,
+                                        'Actual': actual_values_valid.values,
+                                        'Fitted': in_sample_pred_valid
+                                    })
+                                    
+                                    # Plot validation
+                                    fig_val = px.line(
+                                        validation_df,
+                                        x='Date',
+                                        y=['Actual', 'Fitted'],
+                                        title=f"In-sample fit for {param} using {model_type}"
+                                    )
+                                    st.plotly_chart(fig_val, use_container_width=True)
                             
                             # Predict future values
                             future_dates, predictions = predict_future(model_results, last_date, ts_df, days_to_predict)
@@ -880,20 +1085,35 @@ if selected_site_id:
                                     
                                     if available_components:
                                         st.write(f"Components: {', '.join(available_components)}")
+                                        
+                                    # Display cap and floor
+                                    st.write(f"Upper Cap: {model_results.get('cap', 'Not set')}")
+                                    st.write(f"Lower Floor: {model_results.get('floor', 'Not set')}")
                                 except:
                                     pass
                             
-                            elif selected_model == "arima":
-                                st.write("#### ARIMA Model")
+                            elif selected_model == "sarimax":
+                                st.write("#### SARIMAX Model")
                                 model = model_results["model"]
                                 
                                 # Display the model order (p,d,q)
                                 try:
                                     order = model.model.order
-                                    st.write(f"Model Order (p,d,q): {order}")
-                                    st.write("- p: Autoregressive order")
-                                    st.write("- d: Differencing order")
-                                    st.write("- q: Moving average order")
+                                    seasonal_order = model.model.seasonal_order if hasattr(model.model, 'seasonal_order') else None
+                                    
+                                    st.write(f"Non-seasonal Order (p,d,q): {order}")
+                                    if seasonal_order:
+                                        st.write(f"Seasonal Order (P,D,Q,s): {seasonal_order}")
+                                        
+                                    st.write("**Model Parameters:**")
+                                    st.write("- p: Autoregressive order (non-seasonal)")
+                                    st.write("- d: Differencing order (non-seasonal)")
+                                    st.write("- q: Moving average order (non-seasonal)")
+                                    if seasonal_order:
+                                        st.write("- P: Seasonal autoregressive order")
+                                        st.write("- D: Seasonal differencing order")
+                                        st.write("- Q: Seasonal moving average order")
+                                        st.write("- s: Seasonal period (24 = daily seasonality for hourly data)")
                                 except:
                                     pass
                             
@@ -903,6 +1123,10 @@ if selected_site_id:
                                     model = model_results["model"]
                                     params = model.params
                                     
+                                    # Display damped trend if available
+                                    damped = getattr(model, 'damped_trend', False)
+                                    st.write(f"Damped trend: {'Yes' if damped else 'No'}")
+                                    
                                     # Display alpha, beta, gamma values if available
                                     if hasattr(params, 'smoothing_level'):
                                         st.write(f"Alpha (level): {params.smoothing_level:.4f}")
@@ -910,10 +1134,12 @@ if selected_site_id:
                                         st.write(f"Beta (trend): {params.smoothing_trend:.4f}")
                                     if hasattr(params, 'smoothing_seasonal'):
                                         st.write(f"Gamma (seasonal): {params.smoothing_seasonal:.4f}")
+                                    if hasattr(params, 'damping_trend'):
+                                        st.write(f"Phi (damping): {params.damping_trend:.4f}")
                                 except:
                                     pass
                 else:
-                    min_data_msg = "48 hours" if selected_model == "holt_winters" else "24 hours"
+                    min_data_msg = "48 hours" if selected_model in ["holt_winters", "sarimax"] else "24 hours"
                     st.warning(f"Not enough data available for {param} predictions using {model_type}. Need at least {min_data_msg} of data.")
     else:
         st.error(f"No data available for site {selected_site_id} with the selected parameters and date range.")
